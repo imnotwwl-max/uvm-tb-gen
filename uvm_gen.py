@@ -4,6 +4,7 @@ UVM Testbench Generator
 Generates a complete UVM testbench skeleton from user inputs.
 """
 
+import argparse
 import os
 import sys
 
@@ -859,19 +860,85 @@ def gen_filelist(proj, agent_names, sb_pairs, tb_dir):
 
 
 # ---------------------------------------------------------------------------
-# Main
+# CLI
 # ---------------------------------------------------------------------------
 
+def build_arg_parser():
+    parser = argparse.ArgumentParser(
+        prog="uvm_gen.py",
+        description=(
+            "Generate a complete UVM testbench skeleton: one agent per "
+            "--agents, one scoreboard auto-connected to each agent, a "
+            "virtual sequencer/sequence tying all agents together, a RAL "
+            "register model (2 RW + 1 RO) wired to the first agent via an "
+            "adapter + predictor, a smoke test, a filelist, and a README."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  Interactive (prompts for every value):\n"
+            "    %(prog)s\n\n"
+            "  Non-interactive, one-line generation:\n"
+            "    %(prog)s --project my_proj --agents 3 --output ./my_proj_tb\n\n"
+            "  Use the project name to derive the default output dir "
+            "(./my_proj_tb):\n"
+            "    %(prog)s --project my_proj --agents 2\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--project", "-p",
+        metavar="NAME",
+        help="Project name, used as the prefix for all generated top-level "
+             "files (e.g. NAME_env.sv, NAME_pkg.sv). Required for "
+             "non-interactive mode.",
+    )
+    parser.add_argument(
+        "--agents", "-a",
+        metavar="N",
+        type=int,
+        help="Number of agents to generate (1-16). Agents are auto-named "
+             "agent0..agentN-1, each gets its own interface, seq_item, "
+             "driver, monitor, and a 1:1 connected scoreboard. Required "
+             "for non-interactive mode.",
+    )
+    parser.add_argument(
+        "--output", "-o",
+        metavar="DIR",
+        help="Output directory for generated files. "
+             "Defaults to ./<project>_tb if omitted.",
+    )
+    return parser
+
+
 def main():
-    print("=" * 60)
-    print("  UVM Testbench Generator")
-    print("=" * 60)
-    print()
+    parser = build_arg_parser()
+    args = parser.parse_args()
 
-    proj = prompt("Project name (e.g. my_proj)")
-    n_agents = prompt_int("Number of agents", 1, 16)
+    non_interactive = args.project is not None or args.agents is not None
 
-    out_dir = prompt("Output directory", f"./{proj}_tb")
+    if non_interactive:
+        if not args.project:
+            parser.error("--project is required when using command-line arguments")
+        if not args.agents:
+            parser.error("--agents is required when using command-line arguments")
+        if not (1 <= args.agents <= 16):
+            parser.error("--agents must be between 1 and 16")
+        proj = args.project
+        n_agents = args.agents
+        out_dir = args.output or f"./{proj}_tb"
+        print("=" * 60)
+        print("  UVM Testbench Generator")
+        print("=" * 60)
+        print()
+    else:
+        print("=" * 60)
+        print("  UVM Testbench Generator")
+        print("=" * 60)
+        print()
+        proj = prompt("Project name (e.g. my_proj)")
+        n_agents = prompt_int("Number of agents", 1, 16)
+        out_dir = prompt("Output directory", f"./{proj}_tb")
+
     tb_dir = os.path.abspath(out_dir)
 
     print()
