@@ -50,12 +50,16 @@ def gen_interface(proj, agent_name):
 interface {a}_if (input logic clk, input logic rst_n);
 
   logic       valid;
+  logic [7:0] addr;
+  logic       rnw;     // 1 = read, 0 = write
   logic [7:0] data;
   logic       ready;
 
   clocking driver_cb @(posedge clk);
     default input #1 output #1;
     output valid;
+    output addr;
+    output rnw;
     output data;
     input  ready;
   endclocking
@@ -63,6 +67,8 @@ interface {a}_if (input logic clk, input logic rst_n);
   clocking monitor_cb @(posedge clk);
     default input #1;
     input valid;
+    input addr;
+    input rnw;
     input data;
     input ready;
   endclocking
@@ -82,9 +88,13 @@ def gen_seq_item(proj, agent_name):
 class {a}_seq_item extends uvm_sequence_item;
 
   `uvm_object_utils_begin({a}_seq_item)
+    `uvm_field_int(addr, UVM_ALL_ON)
+    `uvm_field_int(rnw,  UVM_ALL_ON)
     `uvm_field_int(data, UVM_ALL_ON)
   `uvm_object_utils_end
 
+  rand logic [7:0] addr;
+  rand logic       rnw;   // 1 = read, 0 = write
   rand logic [7:0] data;
 
   function new(string name = "{a}_seq_item");
@@ -128,8 +138,12 @@ class {a}_driver extends uvm_driver #({a}_seq_item);
   task drive_item({a}_seq_item req);
     @(vif.driver_cb);
     vif.driver_cb.valid <= 1'b1;
+    vif.driver_cb.addr  <= req.addr;
+    vif.driver_cb.rnw   <= req.rnw;
     vif.driver_cb.data  <= req.data;
     @(vif.driver_cb iff vif.driver_cb.ready);
+    if (req.rnw)
+      req.data = vif.driver_cb.data;
     vif.driver_cb.valid <= 1'b0;
   endtask
 
@@ -165,6 +179,8 @@ class {a}_monitor extends uvm_monitor;
     forever begin
       @(vif.monitor_cb iff vif.monitor_cb.valid && vif.monitor_cb.ready);
       trans = {a}_seq_item::type_id::create("trans");
+      trans.addr = vif.monitor_cb.addr;
+      trans.rnw  = vif.monitor_cb.rnw;
       trans.data = vif.monitor_cb.data;
       ap.write(trans);
     end
@@ -283,6 +299,142 @@ endclass : {s}
 """
 
 
+# ---------------------------------------------------------------------------
+# RAL — register block, adapter, predictor (attached to one agent)
+# ---------------------------------------------------------------------------
+
+def gen_reg_block(proj):
+    p = proj
+    return f"""\
+// {p}_reg_block.sv — register model: 2 RW registers + 1 RO register
+class {p}_reg_rw extends uvm_reg;
+
+  `uvm_object_utils({p}_reg_rw)
+
+  rand uvm_reg_field value;
+
+  function new(string name = "{p}_reg_rw");
+    super.new(name, 8, UVM_NO_COVERAGE);
+  endfunction
+
+  function void build();
+    value = uvm_reg_field::type_id::create("value");
+    value.configure(
+      .parent              (this),
+      .size                (8),
+      .lsb_pos             (0),
+      .access              ("RW"),
+      .volatile             (0),
+      .reset                (8'h00),
+      .has_reset            (1),
+      .is_rand              (1),
+      .individually_accessible (0));
+  endfunction
+
+endclass : {p}_reg_rw
+
+
+class {p}_reg_ro extends uvm_reg;
+
+  `uvm_object_utils({p}_reg_ro)
+
+  rand uvm_reg_field value;
+
+  function new(string name = "{p}_reg_ro");
+    super.new(name, 8, UVM_NO_COVERAGE);
+  endfunction
+
+  function void build();
+    value = uvm_reg_field::type_id::create("value");
+    value.configure(
+      .parent              (this),
+      .size                (8),
+      .lsb_pos             (0),
+      .access              ("RO"),
+      .volatile             (1),
+      .reset                (8'h00),
+      .has_reset            (1),
+      .is_rand              (0),
+      .individually_accessible (0));
+  endfunction
+
+endclass : {p}_reg_ro
+
+
+class {p}_reg_block extends uvm_reg_block;
+
+  `uvm_object_utils({p}_reg_block)
+
+  rand {p}_reg_rw reg_a;   // R/W register #1 — offset 0x0
+  rand {p}_reg_rw reg_b;   // R/W register #2 — offset 0x4
+  rand {p}_reg_ro reg_c;   // Read-only register — offset 0x8
+
+  function new(string name = "{p}_reg_block");
+    super.new(name, UVM_NO_COVERAGE);
+  endfunction
+
+  function void build();
+    default_map = create_map("default_map", 0, 1, UVM_LITTLE_ENDIAN);
+
+    reg_a = {p}_reg_rw::type_id::create("reg_a");
+    reg_a.configure(this);
+    reg_a.build();
+    default_map.add_reg(reg_a, 'h0, "RW");
+
+    reg_b = {p}_reg_rw::type_id::create("reg_b");
+    reg_b.configure(this);
+    reg_b.build();
+    default_map.add_reg(reg_b, 'h4, "RW");
+
+    reg_c = {p}_reg_ro::type_id::create("reg_c");
+    reg_c.configure(this);
+    reg_c.build();
+    default_map.add_reg(reg_c, 'h8, "RO");
+
+    lock_model();
+  endfunction
+
+endclass : {p}_reg_block
+"""
+
+
+def gen_reg_adapter(proj, agent_name):
+    p = proj
+    a = agent_name
+    return f"""\
+// {p}_reg_adapter.sv — translates uvm_reg_bus_op <-> {a}_seq_item
+class {p}_reg_adapter extends uvm_reg_adapter;
+
+  `uvm_object_utils({p}_reg_adapter)
+
+  function new(string name = "{p}_reg_adapter");
+    super.new(name);
+    supports_byte_enable = 0;
+    provides_responses   = 0;
+  endfunction
+
+  function uvm_sequence_item reg2bus(const ref uvm_reg_bus_op rw);
+    {a}_seq_item item = {a}_seq_item::type_id::create("item");
+    item.addr = rw.addr[7:0];
+    item.rnw  = (rw.kind == UVM_READ);
+    item.data = (rw.kind == UVM_WRITE) ? rw.data[7:0] : 8'h00;
+    return item;
+  endfunction
+
+  function void bus2reg(uvm_sequence_item bus_item, ref uvm_reg_bus_op rw);
+    {a}_seq_item item;
+    if (!$cast(item, bus_item))
+      `uvm_fatal(get_type_name(), "bus_item is not of type {a}_seq_item")
+    rw.kind   = item.rnw ? UVM_READ : UVM_WRITE;
+    rw.addr   = item.addr;
+    rw.data   = item.data;
+    rw.status = UVM_IS_OK;
+  endfunction
+
+endclass : {p}_reg_adapter
+"""
+
+
 def gen_virtual_sequencer(proj, agent_names):
     p = proj
     seqr_decls = "\n".join(
@@ -351,7 +503,7 @@ endclass : {p}_smoke_virtual_seq
 """
 
 
-def gen_env(proj, agent_names, sb_pairs):
+def gen_env(proj, agent_names, sb_pairs, ral_agent):
     p = proj
     agent_decls = "\n".join(f"  {a}_agent {a};" for a in agent_names)
     sb_decls = "\n".join(f"  {s} {s}_inst;" for s, _ in sb_pairs)
@@ -372,6 +524,23 @@ def gen_env(proj, agent_names, sb_pairs):
         f"    {a}.mon.ap.connect({s}_inst.analysis_export);" for s, a in sb_pairs
     )
 
+    ral_decls = f"""\
+  {p}_reg_block ral;
+  {p}_reg_adapter reg_adapter;
+  uvm_reg_predictor #({ral_agent}_seq_item) reg_predictor;"""
+
+    ral_creates = f"""\
+    ral = {p}_reg_block::type_id::create("ral");
+    ral.build();
+    reg_adapter  = {p}_reg_adapter::type_id::create("reg_adapter");
+    reg_predictor = uvm_reg_predictor #({ral_agent}_seq_item)::type_id::create("reg_predictor", this);"""
+
+    ral_connects = f"""\
+    ral.default_map.set_sequencer({ral_agent}.seqr, reg_adapter);
+    reg_predictor.map     = ral.default_map;
+    reg_predictor.adapter = reg_adapter;
+    {ral_agent}.mon.ap.connect(reg_predictor.bus_in);"""
+
     return f"""\
 // {p}_env.sv
 class {p}_env extends uvm_env;
@@ -381,6 +550,7 @@ class {p}_env extends uvm_env;
 {agent_decls}
 {sb_decls}
 {vseqr_decl}
+{ral_decls}
 
   function new(string name, uvm_component parent);
     super.new(name, parent);
@@ -391,11 +561,13 @@ class {p}_env extends uvm_env;
 {agent_creates}
 {sb_creates}
 {vseqr_create}
+{ral_creates}
   endfunction
 
   function void connect_phase(uvm_phase phase);
 {vseqr_connects}
 {sb_connects}
+{ral_connects}
   endfunction
 
 endclass : {p}_env
@@ -554,6 +726,10 @@ package {p}_pkg;
   // Scoreboards
 {sb_block}
 
+  // RAL
+  `include "{p}_reg_block.sv"
+  `include "{p}_reg_adapter.sv"
+
   // Environment
   `include "{p}_virtual_sequencer.sv"
   `include "{p}_virtual_sequence.sv"
@@ -567,7 +743,7 @@ endpackage : {p}_pkg
 """
 
 
-def gen_readme(proj, agent_names, sb_pairs):
+def gen_readme(proj, agent_names, sb_pairs, ral_agent):
     p = proj
     n_agents = len(agent_names)
     n_sb = len(sb_pairs)
@@ -601,7 +777,10 @@ Auto-generated by `uvm_gen.py`.
 """ + "".join(f"    ├── {a}_agent (driver + monitor + sequencer)\n" for a in agent_names) \
   + "".join(f"    ├── {s} (scoreboard ← {a}_monitor)\n" for s, a in sb_pairs) \
   + f"""\
-    └── (connect via {p}_base_test)
+    ├── ral ({p}_reg_block: reg_a [RW], reg_b [RW], reg_c [RO])
+    ├── reg_adapter ({p}_reg_adapter)
+    ├── reg_predictor (uvm_reg_predictor) ← {ral_agent}.mon.ap
+    └── ral.default_map bound to {ral_agent}.seqr
 ```
 
 ## File descriptions
@@ -633,6 +812,15 @@ Auto-generated by `uvm_gen.py`.
     f"| `{s}.sv` | Scoreboard connected to `{a}_monitor`; reports pass/fail count |\n"
     for s, a in sb_pairs
 ) + f"""
+### RAL (Register Abstraction Layer)
+| File | Description |
+|------|-------------|
+| `{p}_reg_block.sv` | `{p}_reg_block` with `reg_a` (RW, 0x0), `reg_b` (RW, 0x4), `reg_c` (RO, 0x8) |
+| `{p}_reg_adapter.sv` | `{p}_reg_adapter` — converts `uvm_reg_bus_op` <-> `{ral_agent}_seq_item` |
+
+RAL is bound to **`{ral_agent}`** via `uvm_reg_predictor` and `ral.default_map.set_sequencer({ral_agent}.seqr, reg_adapter)`.
+Use `ral.reg_a.write(status, data, .parent(seq))` / `ral.reg_a.read(...)` from any sequence running on `{ral_agent}`'s sequencer.
+
 ### Top-level
 | File | Description |
 |------|-------------|
@@ -694,9 +882,14 @@ def main():
     print()
 
     agent_names = [f"agent{i}" for i in range(n_agents)]
+    ral_agent = agent_names[0]
 
     # One scoreboard per agent, always 1:1 connected
     sb_pairs = [(f"{a}_sb", a) for a in agent_names]
+
+    print(f"  RAL         : {proj}_reg_block (reg_a, reg_b = RW, reg_c = RO)")
+    print(f"                attached to '{ral_agent}' via adapter + predictor")
+    print()
 
     def out(filename, content):
         write_file(os.path.join(tb_dir, filename), content)
@@ -717,12 +910,16 @@ def main():
     for s, a in sb_pairs:
         out(f"{s}.sv", gen_scoreboard(proj, s, a))
 
+    # RAL — register block + adapter, bound to ral_agent
+    out(f"{proj}_reg_block.sv",   gen_reg_block(proj))
+    out(f"{proj}_reg_adapter.sv", gen_reg_adapter(proj, ral_agent))
+
     # Virtual sequencer & sequence (incl. smoke virtual sequence)
     out(f"{proj}_virtual_sequencer.sv", gen_virtual_sequencer(proj, agent_names))
     out(f"{proj}_virtual_sequence.sv",  gen_virtual_sequence(proj, agent_names))
 
     # Environment
-    out(f"{proj}_env.sv", gen_env(proj, agent_names, sb_pairs))
+    out(f"{proj}_env.sv", gen_env(proj, agent_names, sb_pairs, ral_agent))
 
     # Tests & tb_top
     out(f"{proj}_base_test.sv",  gen_base_test(proj, agent_names))
@@ -736,7 +933,7 @@ def main():
     out(f"{proj}.f", gen_filelist(proj, agent_names, sb_pairs, tb_dir))
 
     # README
-    out("README.md", gen_readme(proj, agent_names, sb_pairs))
+    out("README.md", gen_readme(proj, agent_names, sb_pairs, ral_agent))
 
     print()
     print("Done! Generated files:")
